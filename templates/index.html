@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webcam Stream</title>
+    <script src="https://cdn.socket.io/4.0.0/socket.io.min.js"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+
+<body>
+    <h1>Video Conferencing</h1>
+    <p>Please provide permission when prompted to access your camera and microphone. This will ensure the best video conferencing experience.</p>
+
+    <div class="controls">
+        <button id="webCamButton" onclick="init();">Start Webcam</button>
+        <button id="callButton" onclick="initiateConnection();">Create Call</button>
+        <label for="callInput">Enter Call ID to join an existing call or create a new call to get an ID:</label>
+        <input type="text" id="callInput">
+        <button id="answerButton" onclick="answerClick()">Answer</button>
+        <button id="hangUpButton" onclick="hangUpClick()">Hangup</button>
+    </div>
+
+    <div class="container">
+        <div class="media-wrapper">
+            <label>Local Stream</label>
+            <video id="video" width="1280" height="720" autoplay playsinline></video>
+        </div>
+        <div class="media-wrapper">
+            <label>Remote Stream</label>
+            <video id="remoteVideo" width="1280" height="720" autoplay playsinline></video>
+        </div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/9.4.0/firebase-app.js';
+        import {
+        addDoc,
+        collection,
+        doc,
+        getDoc,
+        getFirestore,
+        onSnapshot,
+        setDoc,
+        updateDoc
+        } from 'https://www.gstatic.com/firebasejs/9.4.0/firebase-firestore.js';
+    
+        const firebaseConfig = {
+            apiKey: "AIzaSyD_F2QU9kOyUxt83o7ntZiWNVkyFdJDjbM",
+            authDomain: "webrtc-video-conferencin-a2abe.firebaseapp.com",
+            projectId: "webrtc-video-conferencin-a2abe",
+            storageBucket: "webrtc-video-conferencin-a2abe.appspot.com",
+            messagingSenderId: "735538910791",
+            appId: "1:735538910791:web:9f9625ed11fa29e9a50362",
+            measurementId: "G-F55B7DMZK6"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const firestore = getFirestore(app);
+        const callsCollection = collection(firestore, 'calls');
+        const servers = {
+            iceServers: [
+                {
+                urls: ['stun:stun1.l.google.com:19302', 'stun:stun2.l.google.com:19302'],
+                },
+            ],
+            iceCandidatePoolSize: 10,
+            sctp: true,
+        };
+
+        // Global State
+        let peerConnection = new RTCPeerConnection(servers);
+        let localStream = null;
+        let remoteStream = null;
+        const videoElement = document.getElementById('video');
+        const videoDisplayElement = document.getElementById('videoDisplay');
+        const webCamButton = document.getElementById('webCamButton');
+        const callButton = document.getElementById('callButton');
+        const callInput = document.getElementById('callInput');
+        const answerButton = document.getElementById('answerButton');
+        const remoteVideo = document.getElementById('remoteVideo');
+        const hangupButton = document.getElementById('hangUpButton');
+        
+        const socket = io.connect('http://127.0.0.1:5000');
+
+        // Setting constraints for 360p resolution
+        const constraints = {
+            video: {
+                width: 640,
+                height: 360
+            }
+        };
+
+        async function hangUpClick() {
+            peerConnection.close();
+            localStream.getTracks().forEach(track => track.stop());
+            remoteStream.getTracks().forEach(track => track.stop());
+            const callId = callInput.value;
+            const callDoc = doc(callsCollection, callId);
+            await updateDoc(callDoc, { callEnded: true });
+
+            // Reset the UI state
+            hangupButton.disabled = true;
+            callButton.disabled = false;
+            answerButton.disabled = false;
+            webcamButton.disabled = false;
+            callInput.value = '';
+
+            // Gracefully reset the peer connection
+            peerConnection = new RTCPeerConnection(servers);
+        }
+        function monitorCallEnd() {
+            const callId = callInput.value;
+            const callDoc = doc(callsCollection, callId);
+            onSnapshot(callDoc, (snapshot) => {
+                const data = snapshot.data();
+                if (data?.callEnded) {
+                hangupCall();
+                }
+            });
+        }
+
+        async function answerClick() {
+            const callId = callInput.value;
+            const callDoc = doc(callsCollection, callId);
+            const answerCandidates = collection(callDoc, 'answerCandidates');
+            const offerCandidates = collection(callDoc, 'offerCandidates');
+
+            peerConnection.onicecandidate = async (event) => {
+                event.candidate && await addDoc(answerCandidates, event.candidate.toJSON());
+            };
+            const callData = (await getDoc(callDoc)).data();
+            const offerDescription = callData.offer;
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(offerDescription));
+            const answerDescription = await peerConnection.createAnswer();
+            await peerConnection.setLocalDescription(answerDescription);
+            const answer = {
+                type: answerDescription.type,
+                sdp: answerDescription.sdp,
+            };
+            await updateDoc(callDoc, { answer });
+            onSnapshot(collection(callDoc, 'offerCandidates'), (snapshot) => {
+                snapshot.docChanges().forEach((change) => {
+                if (change.type === 'added') {
+                    let data = change.doc.data();
+                    peerConnection.addIceCandidate(new RTCIceCandidate(data));
+                }
+                });
+            });
+        }
+
+        // Access webcam
+        async function init() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                localStream = stream;
+                video.srcObject = localStream;
+                remoteStream = new MediaStream();
+
+                stream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, stream);
+                });
+
+                peerConnection.ontrack = event => {
+                    event.streams[0].getTracks().forEach((track) => {
+                        remoteStream.addTrack(track);
+                        handleRemoteStream(event.streams[0]);
+                    });
+                };
+                remoteVideo.srcObject = remoteStream;
+
+                socket.on('message', message => {
+                    if (message.type === 'offer') {
+                        peerConnection.setRemoteDescription(new RTCSessionDescription(message)).then(() => {
+                            return peerConnection.createAnswer();
+                        }).then(answer => {
+                            return peerConnection.setLocalDescription(answer);
+                        }).then(() => {
+                            socket.emit('message', peerConnection.localDescription);
+                        });
+                    } else if (message.type === 'answer') {
+                        peerConnection.setRemoteDescription(new RTCSessionDescription(message));
+                    } else if (message.ice) {
+                        peerConnection.addIceCandidate(new RTCIceCandidate(message.ice));
+                    }
+                });
+
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        socket.emit('message', {'ice': event.candidate});
+                    }
+                };
+            } catch (e) {
+                console.error('navigator.getUserMedia error:', e);
+            }
+        }
+        // Only one side should call this to initiate the connection
+        async function initiateConnection() {
+            const callDoc = doc(callsCollection);
+            const offerCandidates = collection(callDoc, 'offerCandidates');
+            const answerCandidates = collection(callDoc, 'answerCandidates');
+
+            callInput.value = callDoc.id;
+
+            peerConnection.onicecandidate = async (event) => {
+                event.candidate && await addDoc(offerCandidates, event.candidate.toJSON());
+            };
+
+            const offerDescription = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offerDescription);
+            const offer = {
+                sdp: offerDescription.sdp,
+                type: offerDescription.type,
+            };
+            await setDoc(callDoc, { offer });
+            onSnapshot(doc(firestore, 'calls', callDoc.id), (snapshot) => {
+                const data = snapshot.data();
+                if (!peerConnection.currentRemoteDescription && data?.answer) {
+                const answerDescription = new RTCSessionDescription(data.answer);
+                peerConnection.setRemoteDescription(answerDescription);
+                }
+            });
+            onSnapshot(collection(doc(firestore, 'calls', callDoc.id), 'answerCandidates'), (snapshot) => {
+                snapshot.docChanges().forEach((change) => {
+                if (change.type === 'added') {
+                    const candidate = new RTCIceCandidate(change.doc.data());
+                    peerConnection.addIceCandidate(candidate);
+                }
+                });
+            });
+
+            hangupButton.disabled = false;
+        }
+
+        function handleRemoteStream(stream) {
+            remoteStream = stream;
+            // Send frames to server in real-time
+            const canvas = document.createElement('canvas');
+            canvas.width = 640;
+            canvas.height = 360;
+            const context = canvas.getContext('2d');
+
+            setInterval(() => {
+                context.drawImage(remoteVideo, 0, 0, 640, 360);
+                let imageData = canvas.toDataURL('image/jpeg', 0.4);
+                socket.emit('send_frame', { frame: imageData });
+            }, 50);  // Sending frames every 10ms. Adjust as needed.
+        }
+
+        socket.on('frame_response', function(data) {
+            remoteVideo.src = data.image;
+        });
+
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelector("[onclick='init();']").addEventListener("click", init);
+            document.querySelector("[onclick='initiateConnection();']").addEventListener("click", initiateConnection);
+            document.getElementById("answerButton").addEventListener("click", answerClick);
+            document.getElementById("hangUpButton").addEventListener("click", hangUpClick);
+
+            // Add call monitoring immediately after setting up the call or answering
+            document.getElementById("callButton").addEventListener('click', monitorCallEnd);
+            document.getElementById("answerButton").addEventListener('click', monitorCallEnd);
+        });
+
+
+    </script>
+</body>
+
+</html>
